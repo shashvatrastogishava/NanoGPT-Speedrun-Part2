@@ -103,6 +103,47 @@ class Muon(torch.optim.Optimizer):
                 p.data.add_(g, alpha=-lr * scale)
 
 # -----------------------------------------------------------------------------
+# Orthogonal initialization utility
+
+def init_orthogonal(weight):
+    """
+    Initialize a 2D weight matrix as a random orthogonal matrix using QR decomposition.
+    This ensures optimal conditioning (condition number = 1) from the start of training.
+    
+    For non-square matrices, we orthogonalize along the larger dimension to get 
+    as many orthogonal vectors as possible.
+    """
+    if weight.ndim != 2:
+        return  # only works for 2D matrices
+    
+    # Generate random matrix and orthogonalize via QR decomposition
+    with torch.no_grad():
+        # Create random matrix matching the weight shape
+        random_matrix = torch.randn_like(weight)
+        
+        # QR decomposition gives us an orthogonal matrix Q
+        q, r = torch.linalg.qr(random_matrix)
+        
+        # Copy the orthogonal matrix into the weight
+        weight.copy_(q)
+
+def compute_condition_number(weight):
+    """Compute condition number of a 2D weight matrix."""
+    if weight.ndim != 2:
+        return float('nan')
+    with torch.no_grad():
+        try:
+            # Compute singular values
+            s = torch.linalg.svdvals(weight.float())
+            # Condition number = max singular value / min singular value
+            cond = (s[0] / s[-1]).item()
+            return cond
+        except:
+            return float('nan')
+
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
 class Rotary(torch.nn.Module):
@@ -366,7 +407,18 @@ x, y = train_loader.next_batch()
 # this originates from Karpathy's experiments.
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+
+# Apply orthogonal initialization to attention projection matrices
+# This improves conditioning and complements Muon's runtime orthogonalization
+for module in model.modules():
+    if isinstance(module, CausalSelfAttention):
+        init_orthogonal(module.c_q.weight)
+        init_orthogonal(module.c_k.weight)
+        init_orthogonal(module.c_v.weight)
+        # Note: c_proj keeps its zero initialization as per original design
+
 model = model.cuda()
+
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
@@ -453,6 +505,22 @@ for step in range(args.num_iterations + 1):
             print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
             with open(logfile, "a") as f:
                 f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+
+            cond_q_list, cond_k_list, cond_v_list = [], [], []
+            for module in raw_model.modules():
+                if isinstance(module, CausalSelfAttention):
+                    cond_q_list.append(compute_condition_number(module.c_q.weight))
+                    cond_k_list.append(compute_condition_number(module.c_k.weight))
+                    cond_v_list.append(compute_condition_number(module.c_v.weight))
+            
+            avg_cond_q = sum(cond_q_list) / len(cond_q_list) if cond_q_list else float('nan')
+            avg_cond_k = sum(cond_k_list) / len(cond_k_list) if cond_k_list else float('nan')
+            avg_cond_v = sum(cond_v_list) / len(cond_v_list) if cond_v_list else float('nan')
+            
+            print(f'  avg_cond: Q={avg_cond_q:.2f} K={avg_cond_k:.2f} V={avg_cond_v:.2f}')
+            with open(logfile, "a") as f:
+                f.write(f'  avg_cond: Q={avg_cond_q:.2f} K={avg_cond_k:.2f} V={avg_cond_v:.2f}\n')
+            
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
