@@ -105,27 +105,39 @@ class Muon(torch.optim.Optimizer):
 # -----------------------------------------------------------------------------
 # Orthogonal initialization utility
 
-def init_orthogonal(weight):
+def init_orthogonal_blend(weight, alpha=0.5):
     """
-    Initialize a 2D weight matrix as a random orthogonal matrix using QR decomposition.
-    This ensures optimal conditioning (condition number = 1) from the start of training.
+    Initialize as weighted blend of orthogonal and random matrices.
     
-    For non-square matrices, we orthogonalize along the larger dimension to get 
-    as many orthogonal vectors as possible.
+    This novel initialization strategy combines the conditioning benefits
+    of orthogonal initialization (good for gradient flow) with the diversity 
+    of random initialization (good for multi-head attention diversity).
+    
+    Args:
+        weight: 2D weight tensor to initialize
+        alpha: Blending factor
+               - alpha=0.0: fully random (standard Kaiming init)
+               - alpha=1.0: fully orthogonal (perfect conditioning)
+               - alpha=0.5: equal blend of both
+    
+    The blended initialization maintains some orthogonal structure for 
+    numerical stability while preserving initialization diversity across heads.
     """
     if weight.ndim != 2:
         return  # only works for 2D matrices
     
-    # Generate random matrix and orthogonalize via QR decomposition
     with torch.no_grad():
-        # Create random matrix matching the weight shape
+        # Component 1: Orthogonal matrix via QR decomposition
         random_matrix = torch.randn_like(weight)
-        
-        # QR decomposition gives us an orthogonal matrix Q
         q, r = torch.linalg.qr(random_matrix)
         
-        # Copy the orthogonal matrix into the weight
-        weight.copy_(q)
+        # Component 2: Random matrix with Kaiming scaling
+        fan_in = weight.shape[1]
+        random_component = torch.randn_like(weight) * (2.0 / fan_in) ** 0.5
+        
+        # Blend: alpha * orthogonal + (1-alpha) * random
+        blended = alpha * q + (1 - alpha) * random_component
+        weight.copy_(blended)
 
 def compute_condition_number(weight):
     """Compute condition number of a 2D weight matrix."""
@@ -408,13 +420,20 @@ x, y = train_loader.next_batch()
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 
-# Apply orthogonal initialization to attention projection matrices
-# This improves conditioning and complements Muon's runtime orthogonalization
+# Apply orthogonal blend initialization to attention projection matrices
+# This balances the conditioning benefits of orthogonal init with the 
+# diversity benefits of random init, addressing the multi-head attention
+# need for diverse feature detectors while maintaining gradient stability
+ORTHOGONAL_BLEND_ALPHA = 0.7  # TUNE THIS: 0.0=random, 1.0=fully orthogonal
+
+if master_process:
+    print(f"Applying orthogonal blend initialization (alpha={ORTHOGONAL_BLEND_ALPHA:.2f})...")
+
 for module in model.modules():
     if isinstance(module, CausalSelfAttention):
-        init_orthogonal(module.c_q.weight)
-        init_orthogonal(module.c_k.weight)
-        init_orthogonal(module.c_v.weight)
+        init_orthogonal_blend(module.c_q.weight, alpha=ORTHOGONAL_BLEND_ALPHA)
+        init_orthogonal_blend(module.c_k.weight, alpha=ORTHOGONAL_BLEND_ALPHA)
+        init_orthogonal_blend(module.c_v.weight, alpha=ORTHOGONAL_BLEND_ALPHA)
         # Note: c_proj keeps its zero initialization as per original design
 
 model = model.cuda()
