@@ -332,8 +332,6 @@ model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 if master_process:
     print("Initializing attention weights orthogonally...")
 orthogonalize_weights(model, CausalSelfAttention, ['c_q', 'c_k', 'c_v'])
-# Also initialize MLP weights orthogonally
-orthogonalize_weights(model, MLP, ['c_fc', 'c_proj'])
 
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
