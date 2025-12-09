@@ -569,7 +569,7 @@ for step in range(args.num_iterations + 1):
     # Periodically re-project weights to orthogonal manifold
     # This keeps weights well-conditioned for better gradient flow
     if step > 0 and step % ORTHO_REPROJECT_EVERY == 0:
-        if step < args.num_iterations // 2:
+        if step < args.num_iterations // 16:
             orthogonalize_weights(raw_model, CausalSelfAttention, ['c_q', 'c_k', 'c_v'])
     
     # --------------- TRAINING SECTION END -------------------
