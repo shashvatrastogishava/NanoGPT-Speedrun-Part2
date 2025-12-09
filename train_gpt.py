@@ -371,7 +371,7 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    learning_rate : float = 0.004
+    learning_rate : float = 0.0042
     num_iterations : int = 5100 # number of iterations to run
     warmup_iters : int = 0
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
@@ -561,8 +561,7 @@ for step in range(args.num_iterations + 1):
     # Periodically re-project weights to orthogonal manifold
     # This keeps weights well-conditioned for better gradient flow
     if step > 0 and step % ORTHO_REPROJECT_EVERY == 0:
-        if step < args.num_iterations // 4:
-            orthogonalize_weights(raw_model, CausalSelfAttention, ['c_q', 'c_k', 'c_v'])
+        orthogonalize_weights(raw_model, CausalSelfAttention, ['c_q', 'c_k', 'c_v'])
     
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
