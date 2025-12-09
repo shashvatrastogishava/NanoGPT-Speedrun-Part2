@@ -103,57 +103,52 @@ class Muon(torch.optim.Optimizer):
                 p.data.add_(g, alpha=-lr * scale)
 
 # -----------------------------------------------------------------------------
-# Orthogonal initialization utility
+# Orthogonal weight re-projection utility
 
-def init_orthogonal_blend(weight, alpha=0.5):
+@torch.no_grad()
+def orthogonalize_weights(model, module_type, attr_names):
     """
-    Initialize as weighted blend of orthogonal and random matrices.
-    
-    This novel initialization strategy combines the conditioning benefits
-    of orthogonal initialization (good for gradient flow) with the diversity 
-    of random initialization (good for multi-head attention diversity).
-    
-    Args:
-        weight: 2D weight tensor to initialize
-        alpha: Blending factor
-               - alpha=0.0: fully random (standard Kaiming init)
-               - alpha=1.0: fully orthogonal (perfect conditioning)
-               - alpha=0.5: equal blend of both
-    
-    The blended initialization maintains some orthogonal structure for 
-    numerical stability while preserving initialization diversity across heads.
+    Re-project weight matrices to their nearest orthogonal matrix.
+    This maintains well-conditioned weights throughout training for better gradient flow.
     """
-    if weight.ndim != 2:
-        return  # only works for 2D matrices
+    for module in model.modules():
+        if isinstance(module, module_type):
+            for attr_name in attr_names:
+                weight = getattr(module, attr_name).weight
+                if weight.ndim == 2:
+                    # Use QR decomposition for fast orthogonalization
+                    # Preserves the scale better than SVD-based methods
+                    q, r = torch.linalg.qr(weight.data.float())
+                    # Keep the signs from R diagonal to maintain diversity
+                    signs = torch.sign(torch.diag(r))
+                    weight.data.copy_((q * signs).to(weight.dtype))
+
+@torch.no_grad()
+def calculate_condition_number(model):
+    """
+    Calculates the condition number (max_singular_value / min_singular_value) 
+    for the first Attention block's QKV weights (c_q).
+    """
+    first_block = model.transformer.h[0]
+    weight = first_block.attn.c_q.weight.data.float() # Use Q weight of first block
     
-    with torch.no_grad():
-        # Component 1: Orthogonal matrix via QR decomposition
-        random_matrix = torch.randn_like(weight)
-        q, r = torch.linalg.qr(random_matrix)
-        
-        # Component 2: Random matrix with Kaiming scaling
-        fan_in = weight.shape[1]
-        random_component = torch.randn_like(weight) * (2.0 / fan_in) ** 0.5
-        
-        # Blend: alpha * orthogonal + (1-alpha) * random
-        blended = alpha * q + (1 - alpha) * random_component
-        weight.copy_(blended)
-
-def compute_condition_number(weight):
-    """Compute condition number of a 2D weight matrix."""
-    if weight.ndim != 2:
-        return float('nan')
-    with torch.no_grad():
-        try:
-            # Compute singular values
-            s = torch.linalg.svdvals(weight.float())
-            # Condition number = max singular value / min singular value
-            cond = (s[0] / s[-1]).item()
-            return cond
-        except:
-            return float('nan')
-
-# -----------------------------------------------------------------------------
+    # Need to handle the 3x grouped QKV parameter size
+    if weight.size(0) == 3 * weight.size(1):
+        # We check the first split (Q)
+        weight_to_check = weight.split(weight.size(1))[0]
+    else:
+        weight_to_check = weight
+    
+    # Calculate SVD to get singular values
+    try:
+        S = torch.linalg.svdvals(weight_to_check)
+        max_s = S.max()
+        min_s = S.min()
+        cond_num = max_s / min_s
+        return cond_num.item()
+    except:
+        # Failsafe in case SVD does not converge
+        return float('inf')
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -420,24 +415,12 @@ x, y = train_loader.next_batch()
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 
-# Apply orthogonal blend initialization to attention projection matrices
-# This balances the conditioning benefits of orthogonal init with the 
-# diversity benefits of random init, addressing the multi-head attention
-# need for diverse feature detectors while maintaining gradient stability
-ORTHOGONAL_BLEND_ALPHA = 0.7  # TUNE THIS: 0.0=random, 1.0=fully orthogonal
-
+# Initialize attention weights orthogonally for better conditioning from the start
 if master_process:
-    print(f"Applying orthogonal blend initialization (alpha={ORTHOGONAL_BLEND_ALPHA:.2f})...")
-
-for module in model.modules():
-    if isinstance(module, CausalSelfAttention):
-        init_orthogonal_blend(module.c_q.weight, alpha=ORTHOGONAL_BLEND_ALPHA)
-        init_orthogonal_blend(module.c_k.weight, alpha=ORTHOGONAL_BLEND_ALPHA)
-        init_orthogonal_blend(module.c_v.weight, alpha=ORTHOGONAL_BLEND_ALPHA)
-        # Note: c_proj keeps its zero initialization as per original design
+    print("Initializing attention weights orthogonally...")
+orthogonalize_weights(model, CausalSelfAttention, ['c_q', 'c_k', 'c_v'])
 
 model = model.cuda()
-
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
@@ -486,6 +469,10 @@ if master_process:
         f.write(f'{result.stdout}\n')
         f.write('='*100 + '\n')
 
+# Orthogonal re-projection schedule
+# Re-project weights every N steps to maintain good conditioning
+ORTHO_REPROJECT_EVERY = 50  # Tune this: more frequent = better conditioning but slower
+
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -521,25 +508,10 @@ for step in range(args.num_iterations + 1):
         val_loss /= val_steps
         # log val loss to console and to logfile
         if master_process:
-            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+            cond_num = calculate_condition_number(raw_model)
+            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} cond_num:{cond_num:.0f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
             with open(logfile, "a") as f:
-                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
-
-            cond_q_list, cond_k_list, cond_v_list = [], [], []
-            for module in raw_model.modules():
-                if isinstance(module, CausalSelfAttention):
-                    cond_q_list.append(compute_condition_number(module.c_q.weight))
-                    cond_k_list.append(compute_condition_number(module.c_k.weight))
-                    cond_v_list.append(compute_condition_number(module.c_v.weight))
-            
-            avg_cond_q = sum(cond_q_list) / len(cond_q_list) if cond_q_list else float('nan')
-            avg_cond_k = sum(cond_k_list) / len(cond_k_list) if cond_k_list else float('nan')
-            avg_cond_v = sum(cond_v_list) / len(cond_v_list) if cond_v_list else float('nan')
-            
-            print(f'  avg_cond: Q={avg_cond_q:.2f} K={avg_cond_k:.2f} V={avg_cond_v:.2f}')
-            with open(logfile, "a") as f:
-                f.write(f'  avg_cond: Q={avg_cond_q:.2f} K={avg_cond_k:.2f} V={avg_cond_v:.2f}\n')
-            
+                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} cond_num:{cond_num:.0f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -585,6 +557,12 @@ for step in range(args.num_iterations + 1):
         sched.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
+    
+    # Periodically re-project weights to orthogonal manifold
+    # This keeps weights well-conditioned for better gradient flow
+    if step > 0 and step % ORTHO_REPROJECT_EVERY == 0:
+        orthogonalize_weights(raw_model, CausalSelfAttention, ['c_q', 'c_k', 'c_v'])
+    
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
