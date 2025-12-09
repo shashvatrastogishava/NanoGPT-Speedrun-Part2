@@ -371,7 +371,7 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    learning_rate : float = 0.0036
+    learning_rate : float = 0.0042
     num_iterations : int = 5100 # number of iterations to run
     warmup_iters : int = 0
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
@@ -435,26 +435,18 @@ optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_
 optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.learning_rate, momentum=0.95)
 optimizers = [optimizer1, optimizer2]
 # learning rate decay scheduler (linear warmup and warmdown)
-# learning rate decay scheduler (linear warmup, boost during orthogonal phase, and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
-    
     # 1) linear warmup for warmup_iters steps
     if it < args.warmup_iters:
         return (it+1) / args.warmup_iters
-    
-    # 2) check if in warmdown phase
-    elif it >= args.num_iterations - args.warmdown_iters:
+    # 2) constant lr for a while
+    elif it < args.num_iterations - args.warmdown_iters:
+        return 1.0
+    # 3) linear warmdown
+    else:
         decay_ratio = (args.num_iterations - it) / args.warmdown_iters
         return decay_ratio
-    
-    # 3) constant lr, but boost during orthogonal constraint phase
-    else:
-        if it < args.num_iterations // 16:
-            return 1.5  # 20% higher during orthogonal re-projection phase
-        else:
-            return 1.0  # normal LR after constraints are released
-
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
 # begin logging
@@ -566,6 +558,11 @@ for step in range(args.num_iterations + 1):
     # null the gradients
     model.zero_grad(set_to_none=True)
     
+    # Periodically re-project weights to orthogonal manifold
+    # This keeps weights well-conditioned for better gradient flow
+    if step > 0 and step % ORTHO_REPROJECT_EVERY == 0:
+        if step < args.num_iterations // 16:
+            orthogonalize_weights(raw_model, CausalSelfAttention, ['c_q', 'c_k', 'c_v'])
     
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
